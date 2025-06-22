@@ -9,4 +9,4 @@ services:
       - key: BOT_TOKEN
         value: your_bot_token_here
       - key: DATABASE_URL
-        value: your_database_url_here
+        value: postgresql://degencred_bot_user:y3GZTCEIuSK5JtIHlFTDLujYWBjfzUwi@dpg-d1c97kur433s7386em5g-a.oregon-postgres.render.com/degencred_bot
