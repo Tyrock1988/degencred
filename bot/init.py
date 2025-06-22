@@ -1,0 +1,1 @@
+# DegenCred Bot Package
