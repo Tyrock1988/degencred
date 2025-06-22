@@ -10,3 +10,18 @@ services:
         value: your_bot_token_here
       - key: DATABASE_URL
         value: postgresql://degencred_bot_user:y3GZTCEIuSK5JtIHlFTDLujYWBjfzUwi@dpg-d1c97kur433s7386em5g-a.oregon-postgres.render.com/degencred_bot
+
+  - type: web
+    name: degencred-bot
+    env: python
+    runtime: python-3.11.6
+    plan: free
+    buildCommand: apt-get update && apt-get install -y libjpeg-dev zlib1g-dev && pip install -r requirements.txt
+    startCommand: gunicorn -w 4 -b 0.0.0.0:8000 app:app
+    envVars:
+      - key: BOT_TOKEN
+        value: your_bot_token_here
+      - key: DATABASE_URL
+        fromDatabase:
+          name: degencred_bot
+          property: connectionString
