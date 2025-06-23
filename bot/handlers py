@@ -1,0 +1,238 @@
+
+import os
+import logging
+from datetime import datetime, timedelta, time
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ConversationHandler,
+)
+from config import ADMIN_IDS
+from utils.badge_manager import check_badges
+from utils import loan_utils
+import database
+from decimal import Decimal
+import psycopg2.extras
+
+logger = logging.getLogger(__name__)
+
+# Conversation states
+SELECT_LOAN_BUTTON = 1
+LOAN_CONFIRM = 2
+
+# Constants
+UNVERIFIED = 0
+VERIFIED = 1
+LOAN_PAID = 'paid'
+LOAN_OVERDUE = 'overdue'
+LOAN_CREDITED = 'credited'
+LOAN_PENDING_VERIFICATION = 'pending_payment_verification'
+
+LEVEL_SPECIFIC_AMOUNTS = {
+    'L1': Decimal('5'),
+    'L2': Decimal('10'),
+    'L3': Decimal('15'),
+    'L4': Decimal('20'),
+    'L5': Decimal('25'),
+}
+
+async def get_or_create_user(user_id, username):
+    current_time = datetime.now()
+    with database.get_db() as conn:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute("SELECT username, verification_status FROM users WHERE user_id = %s", (user_id,))
+        existing_user = cursor.fetchone()
+        
+        if existing_user:
+            if existing_user['username'] != username:
+                cursor.execute("UPDATE users SET username = %s WHERE user_id = %s", (username, user_id))
+            return existing_user
+        else:
+            cursor.execute("""
+                INSERT INTO users (user_id, username, total_rep, level, join_date, verification_status, last_active)
+                VALUES (%s, %s, 0, 1, %s, %s, %s)
+            """, (user_id, username, current_time, UNVERIFIED, current_time))
+            return {'username': username, 'verification_status': UNVERIFIED}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    if update.message.chat.type == 'private':
+        # Handle verification if coming from group
+        if context.args and context.args[0].startswith('verify_'):
+            await handle_start_verification(update, context)
+            return
+            
+        await update.message.reply_text(
+            "🌟 DegenCred Bot - Private Chat 🌟\n\n"
+            "This bot helps manage reputation in groups.\n"
+            "Use these commands in group chats:\n"
+            "/plusrep - Give reputation to others\n"
+            "/reputation - Check your stats\n"
+            "/top - See leaderboard"
+        )
+    else:
+        await update.message.reply_text(
+            "🌟 DegenCred Bot 🌟\n\n"
+            "Give reputation with /plusrep\n"
+            "Check stats with /reputation\n"
+            "See leaderboard with /top"
+        )
+
+async def handle_start_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle verification process"""
+    if not update.message or update.message.chat.type != 'private':
+        return
+        
+    args = context.args
+    effective_user = update.effective_user
+    
+    if args and args[0].startswith('verify_'):
+        try:
+            _, user_id_str, chat_id_str = args[0].split('_')
+            user_id = int(user_id_str)
+            chat_id = int(chat_id_str)
+            
+            if effective_user.id != user_id:
+                await update.message.reply_text("❌ You can only verify your own account!")
+                return
+            
+            # Update verification status
+            with database.get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET verification_status = %s WHERE user_id = %s", (VERIFIED, user_id))
+                
+                # Remove verification message if exists
+                cursor.execute("DELETE FROM verification_messages WHERE user_id = %s", (user_id,))
+            
+            await update.message.reply_text("✅ Account verified successfully! You can now use bot commands.")
+            
+        except Exception as e:
+            logger.error(f"Error in verification: {e}")
+            await update.message.reply_text("❌ Verification failed. Please try again.")
+
+async def plusrep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /plusrep command"""
+    if update.message.chat.type not in ('group', 'supergroup'):
+        await update.message.reply_text("This command only works in groups!")
+        return
+    
+    if not update.message.reply_to_message:
+        await update.message.reply_text("🔍 Reply to someone to give them reputation!")
+        return
+    
+    giver = update.effective_user
+    target_user = update.message.reply_to_message.from_user
+    
+    if giver.id == target_user.id:
+        await update.message.reply_text("❌ You can't give reputation to yourself!")
+        return
+    
+    # Create or get users
+    await get_or_create_user(giver.id, giver.username or giver.first_name)
+    await get_or_create_user(target_user.id, target_user.username or target_user.first_name)
+    
+    # Check if giver is verified
+    with database.get_db() as conn:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute("SELECT verification_status FROM users WHERE user_id = %s", (giver.id,))
+        giver_data = cursor.fetchone()
+        
+        if not giver_data or giver_data['verification_status'] != VERIFIED:
+            await send_verification_prompt(context, update.effective_chat.id, giver.id, giver.username or giver.first_name)
+            return
+        
+        # Add reputation
+        cursor.execute("UPDATE users SET total_rep = total_rep + 1 WHERE user_id = %s", (target_user.id,))
+        
+        # Record transaction
+        cursor.execute("""
+            INSERT INTO reputation_transactions (from_user_id, to_user_id, chat_id, amount, timestamp)
+            VALUES (%s, %s, %s, 1, %s)
+        """, (giver.id, target_user.id, update.effective_chat.id, datetime.now()))
+    
+    await update.message.reply_text(f"✅ +1 rep to @{target_user.username or target_user.first_name}!")
+
+async def send_verification_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, username: str):
+    """Send verification prompt to user"""
+    keyboard = [
+        [InlineKeyboardButton("✅ Verify Account", url=f"https://t.me/{context.bot.username}?start=verify_{user_id}_{chat_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"👋 @{username}, please verify your account to use bot commands!\n"
+                 "Click the button below to verify:",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error sending verification prompt: {e}")
+
+async def reputation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /reputation command"""
+    target_user = update.effective_user
+    
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+    
+    await get_or_create_user(target_user.id, target_user.username or target_user.first_name)
+    
+    with database.get_db() as conn:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute("SELECT * FROM users WHERE user_id = %s", (target_user.id,))
+        user_data = cursor.fetchone()
+        
+        if not user_data:
+            await update.message.reply_text("❌ User not found!")
+            return
+        
+        rep_text = (
+            f"👤 <b>@{user_data['username']}</b>\n"
+            f"⭐ Reputation: {user_data['total_rep']}\n"
+            f"🏆 Level: {user_data['level']}\n"
+            f"📅 Joined: {user_data['join_date'].strftime('%Y-%m-%d')}\n"
+            f"✅ Status: {'Verified' if user_data['verification_status'] == VERIFIED else 'Unverified'}"
+        )
+    
+    await update.message.reply_text(rep_text, parse_mode=ParseMode.HTML)
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /top command"""
+    with database.get_db() as conn:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute("""
+        SELECT user_id, username, total_rep, level 
+        FROM users 
+        WHERE verification_status = %s
+        ORDER BY total_rep DESC 
+        LIMIT 10
+        """, (VERIFIED,))
+        top_users = cursor.fetchall()
+    
+    if not top_users:
+        await update.message.reply_text("📊 No users found on the leaderboard yet!")
+        return
+    
+    leaderboard_text = "🏆 <b>Top 10 Degens</b> 🏆\n\n"
+    for i, user in enumerate(top_users):
+        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"▫️ {i+1}."
+        leaderboard_text += f"{medal} @{user['username']} - ⭐ {user['total_rep']} (Level {user['level']})\n"
+    
+    await update.message.reply_text(leaderboard_text, parse_mode=ParseMode.HTML)
+
+def setup_handlers(application):
+    """Set up all bot handlers"""
+    # Basic commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("plusrep", plusrep))
+    application.add_handler(CommandHandler("reputation", reputation))
+    application.add_handler(CommandHandler("top", leaderboard))
+    
+    logger.info("All handlers registered successfully")
+  
